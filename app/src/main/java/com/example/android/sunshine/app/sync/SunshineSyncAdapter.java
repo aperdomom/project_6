@@ -36,6 +36,12 @@ import com.example.android.sunshine.app.R;
 import com.example.android.sunshine.app.Utility;
 import com.example.android.sunshine.app.data.WeatherContract;
 import com.example.android.sunshine.app.muzei.WeatherMuzeiSource;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.PutDataMapRequest;
+import com.google.android.gms.wearable.PutDataRequest;
+import com.google.android.gms.wearable.Wearable;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -51,6 +57,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Vector;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     public final String LOG_TAG = SunshineSyncAdapter.class.getSimpleName();
@@ -86,15 +93,31 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     public static final int LOCATION_STATUS_SERVER_INVALID = 2;
     public static final int LOCATION_STATUS_UNKNOWN = 3;
     public static final int LOCATION_STATUS_INVALID = 4;
+    private GoogleApiClient mGoogleApiClient;
+    private static final int TIMEOUT_MS = 500;
+    private static final String WEATHER_PATH = "/weather";
+    private static final String ID_KEY = "weather_id";
+    private static final String LOW_KEY = "low_temp";
+    private static final String HIGH_KEY = "high_temp";
 
-    public SunshineSyncAdapter(Context context, boolean autoInitialize) {
+
+    SunshineSyncAdapter(Context context, boolean autoInitialize) {
         super(context, autoInitialize);
+        mGoogleApiClient = new GoogleApiClient.Builder(context)
+                .addApi(Wearable.API)
+                .build();
     }
 
     @Override
     public void onPerformSync(Account account, Bundle extras, String authority, ContentProviderClient provider, SyncResult syncResult) {
         Log.d(LOG_TAG, "Starting sync");
-        String locationQuery = Utility.getPreferredLocation(getContext());
+
+        // We no longer need just the location String, but also potentially the latitude and
+        // longitude, in case we are syncing based on a new Place Picker API result.
+        Context context = getContext();
+        String locationQuery = Utility.getPreferredLocation(context);
+        String locationLatitude = String.valueOf(Utility.getLocationLatitude(context));
+        String locationLongitude = String.valueOf(Utility.getLocationLongitude(context));
 
         // These two need to be declared outside the try/catch
         // so that they can be closed in the finally block.
@@ -115,18 +138,33 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
             final String FORECAST_BASE_URL =
                     "http://api.openweathermap.org/data/2.5/forecast/daily?";
             final String QUERY_PARAM = "q";
+            final String LAT_PARAM = "lat";
+            final String LON_PARAM = "lon";
             final String FORMAT_PARAM = "mode";
             final String UNITS_PARAM = "units";
             final String DAYS_PARAM = "cnt";
             final String APPID_PARAM = "APPID";
 
-            Uri builtUri = Uri.parse(FORECAST_BASE_URL).buildUpon()
-                    .appendQueryParameter(QUERY_PARAM, locationQuery)
-                    .appendQueryParameter(FORMAT_PARAM, format)
-                    .appendQueryParameter(UNITS_PARAM, units)
-                    .appendQueryParameter(DAYS_PARAM, Integer.toString(numDays))
-                    .appendQueryParameter(APPID_PARAM, BuildConfig.OPEN_WEATHER_MAP_API_KEY)
-                    .build();
+            Uri.Builder uriBuilder = Uri.parse(FORECAST_BASE_URL).buildUpon();
+
+            // Instead of always building the query based off of the location string, we want to
+            // potentially build a query using a lat/lon value. This will be the case when we are
+            // syncing based off of a new location from the Place Picker API. So we need to check
+            // if we have a lat/lon to work with, and use those when we do. Otherwise, the weather
+            // service may not understand the location address provided by the Place Picker API
+            // and the user could end up with no weather! The horror!
+            if (Utility.isLocationLatLonAvailable(context)) {
+                uriBuilder.appendQueryParameter(LAT_PARAM, locationLatitude)
+                          .appendQueryParameter(LON_PARAM, locationLongitude);
+            } else {
+                uriBuilder.appendQueryParameter(QUERY_PARAM, locationQuery);
+            }
+
+            Uri builtUri = uriBuilder.appendQueryParameter(FORMAT_PARAM, format)
+                                     .appendQueryParameter(UNITS_PARAM, units)
+                                     .appendQueryParameter(DAYS_PARAM, Integer.toString(numDays))
+                                     .appendQueryParameter(APPID_PARAM, BuildConfig.OPEN_WEATHER_MAP_API_KEY)
+                                     .build();
 
             URL url = new URL(builtUri.toString());
 
@@ -136,8 +174,8 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
             urlConnection.connect();
 
             // Read the input stream into a String
-            InputStream inputStream = urlConnection.getInputStream();
-            StringBuffer buffer = new StringBuffer();
+            InputStream   inputStream = urlConnection.getInputStream();
+            StringBuilder buffer      = new StringBuilder();
             if (inputStream == null) {
                 // Nothing to do.
                 return;
@@ -149,7 +187,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                 // Since it's JSON, adding a newline isn't necessary (it won't affect parsing)
                 // But it does make debugging a *lot* easier if you print out the completed
                 // buffer for debugging.
-                buffer.append(line + "\n");
+                buffer.append(line).append("\n");
             }
 
             if (buffer.length() == 0) {
@@ -180,7 +218,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                 }
             }
         }
-        return;
+
     }
 
     /**
@@ -378,68 +416,69 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
 
     private void notifyWeather() {
         Context context = getContext();
-        //checking the last update and notify if it' the first of the day
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
-        String displayNotificationsKey = context.getString(R.string.pref_enable_notifications_key);
-        boolean displayNotifications = prefs.getBoolean(displayNotificationsKey,
-                Boolean.parseBoolean(context.getString(R.string.pref_enable_notifications_default)));
+        String locationQuery = Utility.getPreferredLocation(context);
+        Uri weatherUri = WeatherContract.WeatherEntry.buildWeatherLocationWithDate(locationQuery, System.currentTimeMillis());
 
-        if ( displayNotifications ) {
+        // we'll query our contentProvider, as always
+        Cursor cursor = context.getContentResolver().query(weatherUri, NOTIFY_WEATHER_PROJECTION, null, null, null);
 
-            String lastNotificationKey = context.getString(R.string.pref_last_notification);
-            long lastSync = prefs.getLong(lastNotificationKey, 0);
+        if (cursor!=null && cursor.moveToFirst()) {
+            int weatherId = cursor.getInt(INDEX_WEATHER_ID);
+            double high = cursor.getDouble(INDEX_MAX_TEMP);
+            double low = cursor.getDouble(INDEX_MIN_TEMP);
+            String desc = cursor.getString(INDEX_SHORT_DESC);
 
-            if (System.currentTimeMillis() - lastSync >= DAY_IN_MILLIS) {
+            int iconId = Utility.getIconResourceForWeatherCondition(weatherId);
+            Resources resources = context.getResources();
+            int artResourceId = Utility.getArtResourceForWeatherCondition(weatherId);
+            String artUrl = Utility.getArtUrlForWeatherCondition(context, weatherId);
+
+            // On Honeycomb and higher devices, we can retrieve the size of the large icon
+            // Prior to that, we use a fixed size
+            @SuppressLint("InlinedApi")
+            int largeIconWidth = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
+                    ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
+                    : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
+            @SuppressLint("InlinedApi")
+            int largeIconHeight = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
+                    ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_height)
+                    : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
+
+            // Retrieve the large icon
+            Bitmap largeIcon;
+            try {
+                largeIcon = Glide.with(context)
+                                 .load(artUrl)
+                                 .asBitmap()
+                                 .error(artResourceId)
+                                 .fitCenter()
+                                 .into(largeIconWidth, largeIconHeight).get();
+            } catch (InterruptedException | ExecutionException e) {
+                Log.e(LOG_TAG, "Error retrieving large icon from " + artUrl, e);
+                largeIcon = BitmapFactory.decodeResource(resources, artResourceId);
+            }
+
+            //checking the last update and notify if it' the first of the day
+            SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+            String displayNotificationsKey = context.getString(R.string.pref_enable_notifications_key);
+            boolean displayNotifications = prefs.getBoolean(displayNotificationsKey,
+                                                            Boolean.parseBoolean(context.getString(R.string.pref_enable_notifications_default)));
+
+            if ( displayNotifications ) {
+
+                String lastNotificationKey = context.getString(R.string.pref_last_notification);
+                long lastSync = prefs.getLong(lastNotificationKey, 0);
                 // Last sync was more than 1 day ago, let's send a notification with the weather.
-                String locationQuery = Utility.getPreferredLocation(context);
+                if (System.currentTimeMillis() - lastSync >= DAY_IN_MILLIS) {
 
-                Uri weatherUri = WeatherContract.WeatherEntry.buildWeatherLocationWithDate(locationQuery, System.currentTimeMillis());
 
-                // we'll query our contentProvider, as always
-                Cursor cursor = context.getContentResolver().query(weatherUri, NOTIFY_WEATHER_PROJECTION, null, null, null);
-
-                if (cursor.moveToFirst()) {
-                    int weatherId = cursor.getInt(INDEX_WEATHER_ID);
-                    double high = cursor.getDouble(INDEX_MAX_TEMP);
-                    double low = cursor.getDouble(INDEX_MIN_TEMP);
-                    String desc = cursor.getString(INDEX_SHORT_DESC);
-
-                    int iconId = Utility.getIconResourceForWeatherCondition(weatherId);
-                    Resources resources = context.getResources();
-                    int artResourceId = Utility.getArtResourceForWeatherCondition(weatherId);
-                    String artUrl = Utility.getArtUrlForWeatherCondition(context, weatherId);
-
-                    // On Honeycomb and higher devices, we can retrieve the size of the large icon
-                    // Prior to that, we use a fixed size
-                    @SuppressLint("InlinedApi")
-                    int largeIconWidth = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
-                            ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
-                            : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
-                    @SuppressLint("InlinedApi")
-                    int largeIconHeight = Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB
-                            ? resources.getDimensionPixelSize(android.R.dimen.notification_large_icon_height)
-                            : resources.getDimensionPixelSize(R.dimen.notification_large_icon_default);
-
-                    // Retrieve the large icon
-                    Bitmap largeIcon;
-                    try {
-                        largeIcon = Glide.with(context)
-                                .load(artUrl)
-                                .asBitmap()
-                                .error(artResourceId)
-                                .fitCenter()
-                                .into(largeIconWidth, largeIconHeight).get();
-                    } catch (InterruptedException | ExecutionException e) {
-                        Log.e(LOG_TAG, "Error retrieving large icon from " + artUrl, e);
-                        largeIcon = BitmapFactory.decodeResource(resources, artResourceId);
-                    }
                     String title = context.getString(R.string.app_name);
 
                     // Define the text of the forecast.
                     String contentText = String.format(context.getString(R.string.format_notification),
-                            desc,
-                            Utility.formatTemperature(context, high),
-                            Utility.formatTemperature(context, low));
+                                                       desc,
+                                                       Utility.formatTemperature(context, high),
+                                                       Utility.formatTemperature(context, low));
 
                     // NotificationCompatBuilder is a very convenient way to build backward-compatible
                     // notifications.  Just throw in some data.
@@ -478,9 +517,36 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                     editor.putLong(lastNotificationKey, System.currentTimeMillis());
                     editor.commit();
                 }
-                cursor.close();
             }
+
+            ConnectionResult result = mGoogleApiClient.blockingConnect(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            Log.d(LOG_TAG, "Google API result: " + result);
+
+            if (!mGoogleApiClient.isConnected()) {
+                Log.d(LOG_TAG, "Google API not connected");
+                return;
+            }
+
+            //create data item
+            PutDataMapRequest dataMap = PutDataMapRequest.create(WEATHER_PATH);
+            dataMap.getDataMap().putInt(ID_KEY, weatherId);
+            dataMap.getDataMap().putDouble(HIGH_KEY, high);
+            dataMap.getDataMap().putDouble(LOW_KEY, low);
+            PutDataRequest request = dataMap.asPutDataRequest();
+            request.setUrgent();
+
+            //send data to wearable
+            DataApi.DataItemResult dataItemResult = Wearable.DataApi
+                    .putDataItem(mGoogleApiClient, request).await();
+
+            Log.d (LOG_TAG, dataItemResult.toString());
+            Log.d (LOG_TAG, dataItemResult.getStatus().getStatusMessage());
+
+            mGoogleApiClient.disconnect();
         }
+
+        if (cursor!=null)
+            cursor.close();
     }
 
     /**
@@ -503,7 +569,7 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                 new String[]{locationSetting},
                 null);
 
-        if (locationCursor.moveToFirst()) {
+        if (locationCursor !=null && locationCursor.moveToFirst()) {
             int locationIdIndex = locationCursor.getColumnIndex(WeatherContract.LocationEntry._ID);
             locationId = locationCursor.getLong(locationIdIndex);
         } else {
@@ -527,8 +593,9 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
             // The resulting URI contains the ID for the row.  Extract the locationId from the Uri.
             locationId = ContentUris.parseId(insertedUri);
         }
-
-        locationCursor.close();
+        if (locationCursor!=null){
+            locationCursor.close();
+        }
         // Wait, that worked?  Yes!
         return locationId;
     }
